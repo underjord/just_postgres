@@ -1,0 +1,76 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    env:
+      MIX_ENV: test
+      # Always build from source so the Makefile gets exercised. The cache
+      # below keeps this to the first run after the Makefile changes.
+      JUST_POSTGRES_BUILD: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pair:
+              elixir: "1.20"
+              otp: "28"
+          - pair:
+              elixir: "1.20"
+              otp: "29"
+            lint: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL build dependencies
+        run: sudo apt-get update && sudo apt-get install -y bison flex libssl-dev zlib1g-dev
+
+      - uses: erlef/setup-beam@main
+        with:
+          otp-version: ${{ matrix.pair.otp }}
+          elixir-version: ${{ matrix.pair.elixir }}
+          version-type: loose
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+            ~/.cache/just_postgres
+          # cache per OTP, and rebuild PostgreSQL when the Makefile changes
+          key: mix-otp-${{ matrix.pair.otp }}-build-${{ hashFiles('**/mix.lock', 'Makefile') }}
+
+      - run: mix deps.get --check-locked
+
+      - run: mix hex.audit
+        if: ${{ matrix.lint }}
+
+      - run: mix format --check-formatted
+        if: ${{ matrix.lint }}
+
+      - run: mix deps.unlock --check-unused
+        if: ${{ matrix.lint }}
+
+      - run: mix deps.compile
+
+      - run: mix compile --no-optional-deps --warnings-as-errors
+        if: ${{ matrix.lint }}
+
+      - run: mix credo --strict
+        if: ${{ matrix.lint }}
+
+      - run: mix spellweaver.check
+        if: ${{ matrix.lint }}
+
+      - run: mix test --slowest 5
+        if: ${{ ! matrix.lint }}
+
+      - run: mix test --slowest 5 --warnings-as-errors
+        if: ${{ matrix.lint }}
+
+      - run: mix dialyzer
+        if: ${{ matrix.lint }}

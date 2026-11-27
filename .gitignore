@@ -22,3 +22,6 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 just_postgres-*.tar
 
+
+# Generated when releasing. See RELEASING.md.
+/checksum.exs
