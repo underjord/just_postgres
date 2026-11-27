@@ -181,6 +181,8 @@ defmodule JustPostgres.Options do
       doc: """
       Milliseconds to wait for a fast shutdown before PostgreSQL is killed.
       A killed server recovers on the next start, which is safe but slower.
+      On Nerves, a reboot gives the whole VM 10 seconds unless erlinit is
+      configured otherwise. See the README.
       """
     ],
     install_dir: [

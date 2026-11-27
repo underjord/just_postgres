@@ -28,6 +28,7 @@
     "Backblaze",
     "basebackup",
     "buildvcs",
+    "dumpall",
     "dumpmachine",
     "DYLD",
     "ecpg",

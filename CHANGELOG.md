@@ -16,4 +16,7 @@ Initial release.
   keeps two clusters from managing the same storage
 * `JustPostgres.restore/1` for point-in-time recovery, plus `backup_now/2`,
   `backup_status/1` and `list_backups/1`
+* Files that `just_postgres` writes into the data directory are replaced
+  atomically and synced, so a power cut can't leave them half written
+* Each server stop is logged with how long it took
 * License texts for everything in the build in `share/licenses`

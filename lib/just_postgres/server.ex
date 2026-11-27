@@ -90,8 +90,12 @@ defmodule JustPostgres.Server do
         do: "#{previous}-#{System.unique_integer([:positive])}",
         else: previous
 
+    # Make sure the restored files are on disk before they replace the
+    # current cluster, and that the renames are, before starting it
+    fsync_tree!(restored)
     File.rename!(data_dir, previous)
     File.rename!(restored, data_dir)
+    fsync!(Path.dirname(data_dir))
 
     Logger.info(
       "#{log_tag(opts[:name])} Restored cluster moved into place. The old one is in #{previous}"
@@ -282,12 +286,67 @@ defmodule JustPostgres.Server do
   end
 
   @doc false
+  # Write a file readable only by the server's user. After a crash or a
+  # power cut, it has either its old contents or the new ones. A plain write
+  # can leave an empty or truncated file, and a truncated cluster id would
+  # stop backups.
   @spec write_private_file!(Path.t(), iodata(), OSUser.t() | nil) :: :ok
   def write_private_file!(path, contents, user) do
-    File.write!(path, contents)
-    File.chmod!(path, 0o600)
-    if user, do: chown!(path, user)
-    :ok
+    tmp = "#{path}.tmp-#{System.unique_integer([:positive])}"
+
+    try do
+      File.open!(tmp, [:write, :raw, :binary], fn fd ->
+        File.chmod!(tmp, 0o600)
+        :ok = :file.write(fd, contents)
+        :ok = :file.sync(fd)
+      end)
+
+      if user, do: chown!(tmp, user)
+      File.rename!(tmp, path)
+      fsync!(Path.dirname(path))
+    after
+      _ = File.rm(tmp)
+    end
+  end
+
+  @doc false
+  # Flush a file or directory to disk. A new name, from creating or renaming
+  # a file, is only on disk once its directory has been synced.
+  @spec fsync!(Path.t()) :: :ok
+  def fsync!(path) do
+    modes = if File.dir?(path), do: [:read, :raw, :directory], else: [:read, :raw]
+
+    case :file.open(path, modes) do
+      {:ok, fd} ->
+        try do
+          case :file.sync(fd) do
+            :ok -> :ok
+            {:error, reason} -> raise File.Error, reason: reason, action: "sync", path: path
+          end
+        after
+          :file.close(fd)
+        end
+
+      {:error, reason} ->
+        raise File.Error, reason: reason, action: "open for syncing", path: path
+    end
+  end
+
+  @doc false
+  # Flush everything in a directory tree, each directory after its contents
+  @spec fsync_tree!(Path.t()) :: :ok
+  def fsync_tree!(dir) do
+    for entry <- File.ls!(dir) do
+      path = Path.join(dir, entry)
+
+      case File.lstat!(path) do
+        %File.Stat{type: :directory} -> fsync_tree!(path)
+        %File.Stat{type: :regular} -> fsync!(path)
+        _ -> :ok
+      end
+    end
+
+    fsync!(dir)
   end
 
   defp init_or_restore(state) do
@@ -353,8 +412,10 @@ defmodule JustPostgres.Server do
     if File.ls!(data_dir) == [] do
       case Recovery.fetch(ctx, backup, %{}) do
         {:ok, restored} ->
+          fsync_tree!(restored)
           File.rmdir!(data_dir)
           File.rename!(restored, data_dir)
+          fsync!(Path.dirname(data_dir))
           :ok
 
         {:error, {:fetch_failed, _, _} = reason} ->
@@ -495,6 +556,7 @@ defmodule JustPostgres.Server do
       daemon ->
         opts = state.opts
         timeout_s = max(div(opts[:shutdown_timeout], 1000), 1)
+        started = System.monotonic_time(:millisecond)
 
         {output, status} =
           MuonTrap.cmd(
@@ -503,7 +565,13 @@ defmodule JustPostgres.Server do
             run_opts(state.user, state.env)
           )
 
-        if status != 0 do
+        # On Nerves, a reboot only waits so long for the VM to exit (see the
+        # README), so it's worth knowing how long this takes
+        elapsed = System.monotonic_time(:millisecond) - started
+
+        if status == 0 do
+          Logger.info("#{log_tag(opts[:name])} PostgreSQL stopped in #{elapsed} ms")
+        else
           Logger.warning("#{log_tag(opts[:name])} pg_ctl stop failed (#{status}): #{output}")
         end
 

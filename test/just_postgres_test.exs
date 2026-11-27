@@ -143,6 +143,28 @@ defmodule JustPostgresTest do
     end
   end
 
+  describe "durable files" do
+    test "write_private_file! replaces the file and leaves nothing behind", %{dir: dir} do
+      path = Path.join(dir, "marker.json")
+      File.write!(path, "old")
+
+      assert :ok = Server.write_private_file!(path, ["new", " contents"], nil)
+
+      assert File.read!(path) == "new contents"
+      assert File.stat!(path).mode |> Bitwise.band(0o777) == 0o600
+      assert File.ls!(dir) == ["marker.json"]
+    end
+
+    test "fsync_tree! syncs files and directories", %{dir: dir} do
+      File.mkdir_p!(Path.join(dir, "a/b"))
+      File.write!(Path.join(dir, "a/b/file"), "x")
+      File.ln_s!("missing", Path.join(dir, "a/link"))
+
+      assert :ok = Server.fsync_tree!(dir)
+      assert_raise File.Error, fn -> Server.fsync!(Path.join(dir, "nope")) end
+    end
+  end
+
   describe "OSUser" do
     test "looks users up in a passwd file", %{dir: dir} do
       passwd = Path.join(dir, "passwd")

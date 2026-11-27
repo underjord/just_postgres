@@ -124,10 +124,62 @@ rpi5 kernel has both.
 * **Stale lock files**: PIDs repeat across reboots. After a power cut,
   `postmaster.pid` can name a live process that isn't PostgreSQL, which
   would block startup. Those files are removed.
-* **Firmware updates**: a firmware with a different PostgreSQL major
-  version won't start against an existing cluster. You'll get a clear error
-  instead of a confusing one. Minor versions are safe to update and roll
-  back.
+
+## Reboots, power cuts and firmware updates
+
+### Reboots and firmware updates
+
+`Nerves.Runtime.reboot/0` stops the supervision tree, and so does NervesHub
+after it applies an update. That gives PostgreSQL a fast shutdown: it
+closes connections and writes every changed page in a shutdown checkpoint,
+so the next start needs no recovery. The new firmware then starts the same
+cluster.
+
+A reboot only waits so long, though. erlinit gives the whole Erlang VM 10
+seconds to exit and then kills what's left. On a Raspberry Pi, the hardware
+watchdog resets the board after 15 seconds either way. The checkpoint
+usually takes well under a second. After a burst of writes on a slow SD
+card it can take longer than 10 seconds. If PostgreSQL is killed, nothing
+committed is lost: the next start replays the WAL first, which takes
+longer. To give the checkpoint more time, raise both limits:
+
+```elixir
+# config/target.exs
+config :nerves, :erlinit, graceful_shutdown_timeout: 30_000
+```
+
+```text
+# rel/vm.args.eex, for the hardware watchdog
+-env HEART_KERNEL_TIMEOUT 40
+```
+
+Each stop is logged with how long it took, for example "PostgreSQL stopped
+in 2406 ms".
+
+### Power cuts
+
+PostgreSQL only reports a commit as done once it's flushed to disk. After a
+power cut, the next start replays WAL from the last checkpoint and comes
+back with everything that was committed. That relies on the storage
+actually writing data when asked to flush it, which some cheap SD cards
+don't. Leave `fsync` and `full_page_writes` on. `just_postgres` writes its
+own files, such as `pg_hba.conf` and the cluster id used for backups, so
+that a power cut leaves either the old version or the new one, never a
+partial file.
+
+### PostgreSQL versions
+
+Each `just_postgres` release bundles one PostgreSQL version. A firmware
+update to a new minor version (18.7 to 18.8) just works, and so does
+rolling it back.
+
+A new major version can't open an older cluster. A firmware with a
+different major version doesn't start PostgreSQL, logs why and leaves the
+cluster alone, so rolling the firmware back brings the database back.
+`just_postgres` can't upgrade a cluster to a new major version yet. To move
+one, dump it with `pg_dumpall` before the update. After the update, restore
+the dump into a new `data_dir`, with a new backup storage prefix, because
+the old backups are for the old version.
 
 ## Backups
 
@@ -183,8 +235,9 @@ JustPostgres.backup_status()
 #     archiver: %{archived_count: 811, failed_count: 0, last_archived_time: ~U[...], ...}}
 ```
 
-A growing `archiver.failed_count` means WAL isn't getting out. Failed
-backups are retried with backoff and logged. `JustPostgres.backup_now/0`
+A growing `archiver.failed_count` means WAL isn't getting out. PostgreSQL
+resets these counters after a crash or power cut. Failed backups are
+retried with backoff and logged. `JustPostgres.backup_now/0`
 takes a backup right away, and `JustPostgres.list_backups/0` lists what's
 in storage.
 
