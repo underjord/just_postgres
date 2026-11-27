@@ -265,7 +265,9 @@ $(BUILD)/.walg-built: $(DL_DIR)/$(WALG_TARBALL) $(THIS_MAKEFILE)
 	rm -rf $(BUILD)/wal-g-src $(BUILD)/wal-g $(BUILD)/wal-g-licenses
 	mkdir -p $(BUILD)/wal-g-src $(BUILD)/wal-g-licenses
 	tar -xzf $< -C $(BUILD)/wal-g-src --strip-components=1
-	cd $(BUILD)/wal-g-src && $(WALG_GOENV) $(GO) build -trimpath -tags "$(WALG_TAGS)" \
+	@# -buildvcs=false: the source is unpacked inside the project's git
+	@# checkout, which Go would otherwise try to stamp into the binary.
+	cd $(BUILD)/wal-g-src && $(WALG_GOENV) $(GO) build -trimpath -buildvcs=false -tags "$(WALG_TAGS)" \
 		-ldflags "$(WALG_LDFLAGS)" -o $(BUILD)/wal-g ./main/pg
 	cd $(BUILD)/wal-g-src && cp "$$($(GO) env GOROOT)/LICENSE" $(BUILD)/wal-g-licenses/go.txt && \
 		$(WALG_GOENV) $(GO) list -deps -tags "$(WALG_TAGS)" \
