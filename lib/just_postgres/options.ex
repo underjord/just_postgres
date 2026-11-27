@@ -24,9 +24,10 @@ defmodule JustPostgres.Options do
     socket_dir: [
       type: :string,
       doc: """
-      Directory for the Unix domain socket. Defaults to a `just_postgres`
-      directory in `System.tmp_dir!/0`. It's created with mode 0700 so that
-      only the server's user (and root) can connect.
+      Directory for the Unix domain socket. Defaults to
+      `just_postgres/<name>` in `System.tmp_dir!/0`, so each server gets its
+      own. It's created with mode 0700 so that only the server's user (and
+      root) can connect.
       """
     ],
     user: [
@@ -189,7 +190,15 @@ defmodule JustPostgres.Options do
       `just_postgres`. Mostly useful for tests.
       """
     ],
-    name: [type: :atom, default: JustPostgres, doc: "Name to register the server under."]
+    name: [
+      type: :atom,
+      default: JustPostgres,
+      doc: """
+      Name to register the server under, and its child id. To run several
+      servers, give each its own name, `data_dir`, `port` and backup storage
+      prefix. Pass the name to `info/1`, `cmd/3` and the other functions.
+      """
+    ]
   ]
 
   @doc false
@@ -211,7 +220,10 @@ defmodule JustPostgres.Options do
 
     opts
     |> Keyword.put_new_lazy(:socket_dir, fn ->
-      Path.join(System.tmp_dir!(), "just_postgres")
+      # One per server. Each server makes its directory 0700 and gives it to
+      # its own OS user.
+      name = opts[:name] |> Atom.to_string() |> String.replace_prefix("Elixir.", "")
+      Path.join([System.tmp_dir!(), "just_postgres", name])
     end)
     |> Keyword.put_new_lazy(:install_dir, &JustPostgres.install_dir/0)
     |> Keyword.update!(:data_dir, &Path.expand/1)

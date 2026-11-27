@@ -420,7 +420,7 @@ defmodule JustPostgres do
   defp do_restore(server, info, opts) do
     with {:ok, backups} <- WalG.list(info),
          {:ok, backup} <- Recovery.select_backup(backups, opts),
-         _ = Logger.info("[JustPostgres] Restoring backup #{backup.name}"),
+         _ = Logger.info("#{Server.log_tag(server)} Restoring backup #{backup.name}"),
          {:ok, restored} <- Recovery.fetch(info, backup, Recovery.target_settings(opts)),
          {:ok, previous} <- GenServer.call(server, {:swap_data_dir, restored}, :infinity) do
       {:ok, %{backup: backup.name, previous_data_dir: previous}}

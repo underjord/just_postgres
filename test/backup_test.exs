@@ -19,14 +19,16 @@ defmodule JustPostgres.BackupTest do
     Keyword.merge([env: %{"WALG_FILE_PREFIX" => store}, retry_interval: 1_000], extra)
   end
 
-  defp psql!(sql) do
-    {output, 0} = JustPostgres.cmd("psql", ["-XAtq", "-v", "ON_ERROR_STOP=1", "-c", sql])
+  defp psql!(sql, server \\ JustPostgres) do
+    {output, 0} =
+      JustPostgres.cmd("psql", ["-XAtq", "-v", "ON_ERROR_STOP=1", "-c", sql], server: server)
+
     String.trim(output)
   end
 
-  defp wait_for_first_backup() do
+  defp wait_for_first_backup(server \\ JustPostgres) do
     wait_for(fn ->
-      case JustPostgres.backup_status() do
+      case JustPostgres.backup_status(server) do
         %{phase: :idle, last_backup: %{} = backup} -> backup
         _ -> nil
       end
@@ -84,6 +86,80 @@ defmodule JustPostgres.BackupTest do
     assert {:ok, second} = JustPostgres.backup_now()
     assert second.name != backup.name
     assert {:ok, [_, _]} = JustPostgres.list_backups()
+  end
+
+  test "runs several servers side by side", %{dir: dir} do
+    servers =
+      for name <- [:jp_side_a, :jp_side_b] do
+        store =
+          dir |> Path.join("store_#{name}") |> tap(&File.mkdir_p!/1) |> give_to_server_user!()
+
+        opts =
+          dir
+          |> Path.join(Atom.to_string(name))
+          |> server_opts(name: name, password: "pw-#{name}", backup: backup_opts(store))
+          # Use the default socket directory, which is per server
+          |> Keyword.delete(:socket_dir)
+
+        {name, opts, store}
+      end
+
+    # Both start at once, so their initdb runs at the same time
+    for {_name, opts, _store} <- servers, do: start_supervised!({JustPostgres, opts})
+
+    for {name, opts, store} <- servers do
+      :ok = JustPostgres.wait_until_ready(name)
+      assert JustPostgres.info(name).socket_dir =~ ~r"/just_postgres/#{name}$"
+
+      # Each got its own superuser password
+      tcp = ["-h", "localhost", "-p", "#{opts[:port]}", "-w", "-tAc", "SELECT 1"]
+
+      assert {_, 0} =
+               JustPostgres.cmd("psql", tcp, server: name, env: [{"PGPASSWORD", "pw-#{name}"}])
+
+      assert {_, 2} = JustPostgres.cmd("psql", tcp, server: name, env: [{"PGPASSWORD", "wrong"}])
+
+      psql!("CREATE TABLE #{name} (id int)", name)
+
+      # ...and backs up to its own storage
+      backup = wait_for_first_backup(name)
+      assert {:ok, [^backup]} = JustPostgres.list_backups(name)
+      {:ok, cluster} = Recovery.read_cluster(opts[:data_dir])
+      owner = store |> Path.join("just_postgres/owner.json") |> File.read!() |> JSON.decode!()
+      assert owner["cluster_id"] == cluster["cluster_id"]
+    end
+
+    assert psql!("SELECT count(*) FROM pg_tables WHERE tablename LIKE 'jp_side_%'", :jp_side_a) ==
+             "1"
+
+    # Stopping one leaves the other alone
+    stop_supervised!(:jp_side_a)
+    refute JustPostgres.ready?(:jp_side_a)
+    assert JustPostgres.ready?(:jp_side_b)
+    assert {:ok, _} = JustPostgres.backup_now(:jp_side_b)
+  end
+
+  test "servers can share a socket directory", %{dir: dir} do
+    shared = Path.join(dir, "shared_run")
+
+    servers =
+      for name <- [:jp_shared_a, :jp_shared_b] do
+        opts =
+          dir
+          |> Path.join(Atom.to_string(name))
+          |> server_opts(name: name, password: "pw-#{name}", socket_dir: shared)
+
+        start_supervised!({JustPostgres, opts})
+        {name, opts}
+      end
+
+    for {name, opts} <- servers do
+      :ok = JustPostgres.wait_until_ready(name)
+      tcp = ["-h", "localhost", "-p", "#{opts[:port]}", "-w", "-tAc", "SELECT 1"]
+
+      assert {_, 0} =
+               JustPostgres.cmd("psql", tcp, server: name, env: [{"PGPASSWORD", "pw-#{name}"}])
+    end
   end
 
   test "keeps only the configured number of full backups", %{dir: dir, store: store} do

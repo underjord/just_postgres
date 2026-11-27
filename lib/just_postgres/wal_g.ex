@@ -134,7 +134,9 @@ defmodule JustPostgres.WalG do
   def write_owner(ctx, owner) do
     # WAL-G runs as the server's user, so the file goes in the socket
     # directory, which belongs to that user.
-    file = Path.join(ctx.socket_dir, ".just_postgres_owner.json")
+    file =
+      Path.join(ctx.socket_dir, ".just_postgres_owner-#{System.unique_integer([:positive])}.json")
+
     Server.write_private_file!(file, JSON.encode!(owner), ctx.user)
 
     args = ["st", "put", "--force", "--no-compress", "--no-encrypt", file, @owner_path]

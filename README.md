@@ -64,6 +64,25 @@ JustPostgres.cmd("psql", ["-c", "SELECT version()"])
 
 See `JustPostgres` for all options.
 
+### More than one server
+
+Nothing in `just_postgres` is global, so you can run several clusters side
+by side. Give each its own `:name`, `:data_dir`, `:port` and, with backups,
+storage prefix, and pass the name to the other functions:
+
+```elixir
+children = [
+  {JustPostgres, name: MyApp.MainDB, data_dir: "/data/pg/main", port: 5432},
+  {JustPostgres, name: MyApp.MetricsDB, data_dir: "/data/pg/metrics", port: 5433}
+]
+
+JustPostgres.wait_until_ready(MyApp.MetricsDB)
+Postgrex.start_link(JustPostgres.connect_options(MyApp.MetricsDB))
+```
+
+Each server gets its own socket directory, and its log lines include its
+name.
+
 ## Nerves setup
 
 ### Add a `postgres` user

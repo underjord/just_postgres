@@ -13,6 +13,7 @@ defmodule JustPostgres.Backup do
   use GenServer
 
   alias JustPostgres.Recovery
+  alias JustPostgres.Server
   alias JustPostgres.WalG
 
   require Logger
@@ -165,7 +166,7 @@ defmodule JustPostgres.Backup do
 
   defp handle_result({:backed_up, latest, count}, state) do
     Logger.info(
-      "[JustPostgres] Base backup #{latest.name} finished. #{count} backup(s) in storage."
+      "#{Server.log_tag(state.server)} Base backup #{latest.name} finished. #{count} backup(s) in storage."
     )
 
     state = %{state | phase: :idle, last_backup: latest, last_error: nil, failures: 0}
@@ -177,7 +178,7 @@ defmodule JustPostgres.Backup do
     delay = min(state.opts[:retry_interval] * Integer.pow(2, state.failures), @max_retry_interval)
 
     Logger.error(
-      "[JustPostgres] Backup failed: #{JustPostgres.Server.format_error(reason)}. " <>
+      "#{Server.log_tag(state.server)} Backup failed: #{Server.format_error(reason)}. " <>
         "Retrying in #{div(delay, 1000)} s."
     )
 
@@ -223,7 +224,7 @@ defmodule JustPostgres.Backup do
   end
 
   defp backup(ctx, opts) do
-    Logger.info("[JustPostgres] Starting a base backup")
+    Logger.info("#{Server.log_tag(ctx.name)} Starting a base backup")
 
     with :ok <- WalG.push(ctx),
          :ok <- retain(ctx, opts[:retain]),
@@ -240,7 +241,7 @@ defmodule JustPostgres.Backup do
 
       {:error, reason} ->
         Logger.warning(
-          "[JustPostgres] Deleting old backups failed: #{JustPostgres.Server.format_error(reason)}"
+          "#{Server.log_tag(ctx.name)} Deleting old backups failed: #{Server.format_error(reason)}"
         )
 
         :ok
@@ -327,7 +328,7 @@ defmodule JustPostgres.Backup do
     }
 
     with :ok <- WalG.write_owner(ctx, owner) do
-      Logger.info("[JustPostgres] This cluster now owns the backup storage")
+      Logger.info("#{Server.log_tag(ctx.name)} This cluster now owns the backup storage")
       _ = Recovery.write_cluster!(ctx.data_dir, ctx.user, Map.put(cluster, "claim", false))
       :ok
     end

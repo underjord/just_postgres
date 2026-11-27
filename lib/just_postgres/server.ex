@@ -48,7 +48,7 @@ defmodule JustPostgres.Server do
          :ok <- prepare_dirs(opts, user),
          :ok <- init_or_restore(state),
          :ok <- write_hba(opts, user),
-         :ok <- clear_stale_pid_file(opts[:data_dir]),
+         :ok <- clear_stale_pid_file(opts),
          {:ok, daemon} <- start_postgres(opts, user, state.env) do
       state = %{state | daemon: daemon, retries: 0}
       {:noreply, start_backup(state)}
@@ -57,14 +57,14 @@ defmodule JustPostgres.Server do
         delay = retry_delay(opts, state.retries)
 
         Logger.warning(
-          "[JustPostgres] #{format_error(reason)}. Retrying in #{div(delay, 1000)} s."
+          "#{log_tag(opts[:name])} #{format_error(reason)}. Retrying in #{div(delay, 1000)} s."
         )
 
         Process.send_after(self(), :retry_start, delay)
         {:noreply, %{state | retries: state.retries + 1}}
 
       {:error, reason} ->
-        Logger.error("[JustPostgres] #{format_error(reason)}")
+        Logger.error("#{log_tag(opts[:name])} #{format_error(reason)}")
         {:stop, reason, state}
     end
   end
@@ -93,15 +93,17 @@ defmodule JustPostgres.Server do
     File.rename!(data_dir, previous)
     File.rename!(restored, data_dir)
 
-    Logger.info("[JustPostgres] Restored cluster moved into place. The old one is in #{previous}")
+    Logger.info(
+      "#{log_tag(opts[:name])} Restored cluster moved into place. The old one is in #{previous}"
+    )
 
     with :ok <- write_hba(opts, state.user),
-         :ok <- clear_stale_pid_file(data_dir),
+         :ok <- clear_stale_pid_file(opts),
          {:ok, daemon} <- start_postgres(opts, state.user, state.env) do
       {:reply, {:ok, previous}, start_backup(%{state | daemon: daemon})}
     else
       {:error, reason} ->
-        Logger.error("[JustPostgres] #{format_error(reason)}")
+        Logger.error("#{log_tag(opts[:name])} #{format_error(reason)}")
         {:stop, reason, {:error, reason}, state}
     end
   end
@@ -112,13 +114,16 @@ defmodule JustPostgres.Server do
   end
 
   def handle_info({:EXIT, daemon, reason}, %{daemon: daemon} = state) do
-    Logger.error("[JustPostgres] postgres exited unexpectedly: #{inspect(reason)}")
+    Logger.error("#{log_tag(state.opts[:name])} postgres exited unexpectedly: #{inspect(reason)}")
     {:stop, {:postgres_exited, reason}, %{state | daemon: nil}}
   end
 
   def handle_info({:EXIT, backup, reason}, %{backup: backup} = state) do
     # The scheduler doesn't hold anything that's lost by restarting it
-    Logger.error("[JustPostgres] Backup scheduler exited: #{inspect(reason)}. Restarting it.")
+    Logger.error(
+      "#{log_tag(state.opts[:name])} Backup scheduler exited: #{inspect(reason)}. Restarting it."
+    )
+
     Process.send_after(self(), :restart_backup, state.opts[:backup][:retry_interval])
     {:noreply, %{state | backup: nil}}
   end
@@ -155,6 +160,7 @@ defmodule JustPostgres.Server do
     opts = state.opts
 
     %{
+      name: opts[:name],
       data_dir: opts[:data_dir],
       socket_dir: opts[:socket_dir],
       port: opts[:port],
@@ -340,7 +346,9 @@ defmodule JustPostgres.Server do
     {:ok, backup} = Recovery.select_backup(backups, [])
     data_dir = ctx.data_dir
 
-    Logger.info("[JustPostgres] No cluster in #{data_dir}. Restoring backup #{backup.name}.")
+    Logger.info(
+      "#{log_tag(ctx.name)} No cluster in #{data_dir}. Restoring backup #{backup.name}."
+    )
 
     if File.ls!(data_dir) == [] do
       case Recovery.fetch(ctx, backup, %{}) do
@@ -374,12 +382,12 @@ defmodule JustPostgres.Server do
   end
 
   defp initdb(opts, user, env) do
-    Logger.info("[JustPostgres] Initializing a new cluster in #{opts[:data_dir]}")
+    Logger.info("#{log_tag(opts[:name])} Initializing a new cluster in #{opts[:data_dir]}")
 
     # initdb needs a password whenever a password auth method is in use. When
     # none is given, use a random one. Set a real one later via the socket.
     password = opts[:password] || Base.encode64(:crypto.strong_rand_bytes(32))
-    pwfile = Path.join(opts[:socket_dir], ".initdb-pwfile")
+    pwfile = Path.join(opts[:socket_dir], ".initdb-pwfile-#{System.unique_integer([:positive])}")
     write_private_file!(pwfile, password, user)
 
     args =
@@ -401,7 +409,7 @@ defmodule JustPostgres.Server do
     try do
       case MuonTrap.cmd(bin(opts, "initdb"), args, run_opts(user, env)) do
         {output, 0} ->
-          Logger.debug("[JustPostgres] initdb: #{output}")
+          Logger.debug("#{log_tag(opts[:name])} initdb: #{output}")
           :ok
 
         {output, status} ->
@@ -435,15 +443,15 @@ defmodule JustPostgres.Server do
   # PostgreSQL refuses to start when postmaster.pid names a live process. On
   # Nerves, PIDs repeat from boot to boot, so the pid of a server that died
   # in a power cut can belong to something else after a reboot.
-  defp clear_stale_pid_file(data_dir) do
-    pid_file = Path.join(data_dir, "postmaster.pid")
+  defp clear_stale_pid_file(opts) do
+    pid_file = Path.join(opts[:data_dir], "postmaster.pid")
 
     with {:ok, contents} <- File.read(pid_file),
          {pid, _} <- Integer.parse(contents),
          {:ok, comm} <- File.read("/proc/#{pid}/comm"),
          false <- String.trim(comm) == "postgres" do
       Logger.warning(
-        "[JustPostgres] Removing stale postmaster.pid (pid #{pid} is #{String.trim(comm)})"
+        "#{log_tag(opts[:name])} Removing stale postmaster.pid (pid #{pid} is #{String.trim(comm)})"
       )
 
       _ = File.rm(pid_file)
@@ -458,7 +466,9 @@ defmodule JustPostgres.Server do
     recovery = Recovery.recovery_settings(data_dir)
 
     if File.exists?(Path.join(data_dir, "recovery.signal")) do
-      Logger.info("[JustPostgres] Recovering from a restored backup #{inspect(recovery)}")
+      Logger.info(
+        "#{log_tag(opts[:name])} Recovering from a restored backup #{inspect(recovery)}"
+      )
     end
 
     args = ["-D", data_dir | settings_args(opts, recovery)]
@@ -468,7 +478,7 @@ defmodule JustPostgres.Server do
         env: env,
         stderr_to_stdout: true,
         log_output: opts[:log_level],
-        log_prefix: "postgres: ",
+        log_prefix: postgres_log_prefix(opts[:name]),
         delay_to_sigkill: 5_000
       ] ++ uid_opts(user)
 
@@ -494,7 +504,7 @@ defmodule JustPostgres.Server do
           )
 
         if status != 0 do
-          Logger.warning("[JustPostgres] pg_ctl stop failed (#{status}): #{output}")
+          Logger.warning("#{log_tag(opts[:name])} pg_ctl stop failed (#{status}): #{output}")
         end
 
         if Process.alive?(daemon), do: GenServer.stop(daemon, :shutdown)
@@ -591,6 +601,15 @@ defmodule JustPostgres.Server do
   defp uid_opts(user), do: [uid: user.name, gid: user.gid]
 
   ## Errors
+
+  @doc false
+  @spec log_tag(atom()) :: String.t()
+  def log_tag(JustPostgres), do: "[JustPostgres]"
+  def log_tag(name), do: "[JustPostgres #{inspect(name)}]"
+
+  # Tell instances apart when there's more than one
+  defp postgres_log_prefix(JustPostgres), do: "postgres: "
+  defp postgres_log_prefix(name), do: "postgres #{inspect(name)}: "
 
   @doc false
   @spec format_error(term()) :: String.t()
