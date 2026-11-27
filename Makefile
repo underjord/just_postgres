@@ -10,10 +10,17 @@
 # lz4 and zstd are built as static libraries since Nerves systems don't ship
 # them. OpenSSL and zlib are linked dynamically when their headers are found.
 #
+# WAL-G, for backups, is built with Go as a static binary with cgo disabled,
+# so it runs on any Linux regardless of libc. It's skipped when Go isn't
+# installed, unless JUST_POSTGRES_WALG=yes.
+#
 # Variables you might want to override:
 #
 #   JUST_POSTGRES_DL_DIR  Where source tarballs are cached
 #   JUST_POSTGRES_SSL     auto (default), yes or no
+#   JUST_POSTGRES_WALG    auto (default), yes or no
+#   WALG_STORAGES         WAL-G storage backends (default "s3 sh", plus fs)
+#   GO                    The go command
 #   JOBS                  Parallel build jobs
 
 # Rebuild everything when this file changes, e.g. on a version bump
@@ -33,6 +40,11 @@ ZSTD_VERSION = 1.5.7
 ZSTD_SHA256 = eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
 ZSTD_TARBALL = zstd-$(ZSTD_VERSION).tar.gz
 ZSTD_URL = https://github.com/facebook/zstd/releases/download/v$(ZSTD_VERSION)/$(ZSTD_TARBALL)
+
+WALG_VERSION = 3.0.10
+WALG_SHA256 = e7ad190500da1eb7cc7fdbe7e86543ce5b884992e99491042c5b2592caacf5fe
+WALG_TARBALL = wal-g-$(WALG_VERSION).tar.gz
+WALG_URL = https://github.com/wal-g/wal-g/archive/refs/tags/v$(WALG_VERSION).tar.gz
 
 # Set by mix.exs. The marker file lets elixir_make notice version changes.
 JUST_POSTGRES_VERSION ?= dev
@@ -120,6 +132,33 @@ USE_ZLIB := $(call have_header,zlib.h)
 
 DEPS_CFLAGS = $(CFLAGS) -fPIC
 
+# WAL-G. Map the target triple to GOOS/GOARCH. With cgo off, Go
+# cross-compiles by itself, so the C toolchain isn't involved.
+GO ?= go
+WALG_STORAGES ?= s3 sh
+WALG_TAGS = disable_grpc_modules grpcnotrace $(addprefix storage_,$(WALG_STORAGES))
+TARGET_CPU := $(firstword $(subst -, ,$(TARGET_TRIPLE)))
+GOARCH_aarch64 = arm64
+GOARCH_arm64 = arm64
+GOARCH_x86_64 = amd64
+GOARCH_riscv64 = riscv64
+GOARCH_i686 = 386
+WALG_GOARCH := $(or $(GOARCH_$(TARGET_CPU)),$(if $(filter arm%,$(TARGET_CPU)),arm))
+WALG_GOOS := $(if $(findstring linux,$(TARGET_TRIPLE)),linux,$(if $(findstring darwin,$(TARGET_TRIPLE)),darwin))
+ifeq ($(WALG_GOARCH),arm)
+WALG_GOARM := $(shell echo | $(CC) $(CFLAGS) -dM -E -x c - | sed -n 's/^\#define __ARM_ARCH \([0-9]*\)$$/\1/p')
+endif
+WALG_GOENV = CGO_ENABLED=0 GOOS=$(WALG_GOOS) GOARCH=$(WALG_GOARCH) $(if $(WALG_GOARM),GOARM=$(WALG_GOARM))
+WALG_LDFLAGS = -s -w -X github.com/wal-g/wal-g/cmd/pg.walgVersion=v$(WALG_VERSION)
+
+JUST_POSTGRES_WALG ?= auto
+ifeq ($(JUST_POSTGRES_WALG),auto)
+HAVE_GO := $(shell command -v $(GO) >/dev/null 2>&1 && echo yes)
+USE_WALG := $(if $(and $(HAVE_GO),$(WALG_GOOS),$(WALG_GOARCH)),yes)
+else ifeq ($(JUST_POSTGRES_WALG),yes)
+USE_WALG = yes
+endif
+
 # Nerves exports TARGET_ARCH (e.g. "aarch64"), but GNU make's built-in
 # compile rules append $(TARGET_ARCH) to the compiler command line. Clear it
 # for the sub-makes.
@@ -139,13 +178,24 @@ PG_CONFIGURE_ARGS = \
 # Things in the install that aren't needed to run a server
 PRUNE = include share/doc lib/pkgconfig lib/pgxs bin/ecpg lib/libecpg* lib/libpgtypes* lib/*.a
 
+LICENSES = $(PG_INSTALL_DIR)/share/licenses
+
 all: $(MARKER)
 
-$(MARKER): $(BUILD)/.pg-installed
+$(MARKER): $(BUILD)/.pg-installed $(if $(USE_WALG),$(BUILD)/.walg-built)
 	@if [ -z "$(USE_SSL)" ]; then echo "just_postgres: WARNING: building without OpenSSL. TLS connections won't be available."; fi
+	@if [ -z "$(USE_WALG)" ]; then echo "just_postgres: WARNING: building without WAL-G (is Go installed?). Backups won't be available."; fi
 	rm -rf $(PG_INSTALL_DIR)
 	mkdir -p $(PREFIX)
 	cp -a $(STAGING)$(PG_PREFIX) $(PG_INSTALL_DIR)
+	mkdir -p $(LICENSES)
+	cp $(BUILD)/postgresql-$(PG_VERSION)/COPYRIGHT $(LICENSES)/postgresql.txt
+	cp $(BUILD)/lz4/lib/LICENSE $(LICENSES)/lz4.txt
+	cp $(BUILD)/zstd/LICENSE $(LICENSES)/zstd.txt
+ifneq ($(USE_WALG),)
+	cp $(BUILD)/wal-g $(PG_INSTALL_DIR)/bin/wal-g
+	cp -R $(BUILD)/wal-g-licenses $(LICENSES)/wal-g
+endif
 	touch $@
 
 $(BUILD)/.pg-installed: $(BUILD)/.pg-built
@@ -207,6 +257,27 @@ $(BUILD)/.zstd-installed: $(DL_DIR)/$(ZSTD_TARBALL) $(THIS_MAKEFILE)
 	cp $(BUILD)/zstd/lib/libzstd.a $(DEPS_PREFIX)/lib/
 	touch $@
 
+# Go downloads WAL-G's dependencies through the module proxy and checks them
+# against WAL-G's go.sum. If the installed Go is older than WAL-G needs, it
+# fetches the right toolchain the same way. The licenses of everything linked
+# into the binary are collected for the install.
+$(BUILD)/.walg-built: $(DL_DIR)/$(WALG_TARBALL) $(THIS_MAKEFILE)
+	rm -rf $(BUILD)/wal-g-src $(BUILD)/wal-g $(BUILD)/wal-g-licenses
+	mkdir -p $(BUILD)/wal-g-src $(BUILD)/wal-g-licenses
+	tar -xzf $< -C $(BUILD)/wal-g-src --strip-components=1
+	cd $(BUILD)/wal-g-src && $(WALG_GOENV) $(GO) build -trimpath -tags "$(WALG_TAGS)" \
+		-ldflags "$(WALG_LDFLAGS)" -o $(BUILD)/wal-g ./main/pg
+	cd $(BUILD)/wal-g-src && cp "$$($(GO) env GOROOT)/LICENSE" $(BUILD)/wal-g-licenses/go.txt && \
+		$(WALG_GOENV) $(GO) list -deps -tags "$(WALG_TAGS)" \
+			-f '{{with .Module}}{{.Path}}{{"\t"}}{{.Dir}}{{end}}' ./main/pg | sort -u | \
+		while IFS="$$(printf '\t')" read -r mod dir; do \
+			mkdir -p "$(BUILD)/wal-g-licenses/$$mod" && \
+			find "$$dir" -maxdepth 1 -type f \( -iname 'licen[cs]e*' -o -iname 'copying*' -o -iname 'notice*' \) \
+				-exec cp {} "$(BUILD)/wal-g-licenses/$$mod/" \; ; \
+		done
+	chmod -R u+w $(BUILD)/wal-g-licenses
+	touch $@
+
 # download(url, file, sha256)
 define download
 	mkdir -p $(DL_DIR)
@@ -224,6 +295,9 @@ $(DL_DIR)/$(LZ4_TARBALL):
 $(DL_DIR)/$(ZSTD_TARBALL):
 	$(call download,$(ZSTD_URL),$@,$(ZSTD_SHA256))
 
+$(DL_DIR)/$(WALG_TARBALL):
+	$(call download,$(WALG_URL),$@,$(WALG_SHA256))
+
 info:
 	@echo "PostgreSQL:     $(PG_VERSION)"
 	@echo "Target:         $(TARGET_TRIPLE)"
@@ -231,6 +305,7 @@ info:
 	@echo "Cross-compile:  $(or $(CROSS_COMPILING),no)"
 	@echo "OpenSSL:        $(or $(USE_SSL),no)"
 	@echo "zlib:           $(or $(USE_ZLIB),no)"
+	@echo "WAL-G:          $(if $(USE_WALG),$(WALG_VERSION) for $(WALG_GOOS)/$(WALG_GOARCH)$(if $(WALG_GOARM),v$(WALG_GOARM)) with $(WALG_STORAGES) fs,no)"
 	@echo "Install to:     $(PG_INSTALL_DIR)"
 	@echo "Downloads:      $(DL_DIR)"
 

@@ -117,7 +117,8 @@ defmodule JustPostgres.MixProject do
 
     A source build needs a C compiler, make, bison, flex, perl and curl.
     Cross-compiles also need zic on the build machine. OpenSSL and zlib
-    headers are used when the compiler can find them.
+    headers are used when the compiler can find them. WAL-G, for backups,
+    is built when Go is installed.
 
     Precompiled archives exist for aarch64-linux-gnu and x86_64-linux-gnu.
     If you're on one of those, check that checksum.exs lists them.

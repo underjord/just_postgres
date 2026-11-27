@@ -24,6 +24,8 @@
     "test"
   ],
   "words": [
+    "Atqc",
+    "Backblaze",
     "basebackup",
     "dumpmachine",
     "DYLD",
@@ -31,13 +33,20 @@
     "eexist",
     "euid",
     "getent",
+    "GOARCH",
+    "GOARM",
+    "GOENV",
+    "GOROOT",
+    "grpcnotrace",
     "hostssl",
     "initgroups",
     "isready",
     "libecpg",
     "liblz",
     "libpgtypes",
+    "libsodium",
     "libzstd",
+    "licen",
     "lzstd",
     "ncpu",
     "nogroup",
@@ -57,8 +66,12 @@
     "regid",
     "reuid",
     "setpriv",
+    "strftime",
     "sysv",
+    "trimpath",
     "uuidv",
+    "walfile",
+    "walg",
     "zdict"
   ]
 }

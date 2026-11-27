@@ -35,7 +35,7 @@ can verify downloads.
 would download archives for the tagged version instead of building the
 current Makefile.
 
-## Updating PostgreSQL, lz4 or zstd
+## Updating PostgreSQL, lz4, zstd or WAL-G
 
 Bump the version and SHA-256 in the `Makefile`. The hashes are published
 next to each tarball:
@@ -43,6 +43,17 @@ next to each tarball:
 * <https://ftp.postgresql.org/pub/source/>
 * <https://github.com/lz4/lz4/releases>
 * <https://github.com/facebook/zstd/releases>
+
+WAL-G doesn't publish a source tarball, so the build uses GitHub's tag
+archive. Hash it yourself:
+
+```sh
+curl -fsSL https://github.com/wal-g/wal-g/archive/refs/tags/v3.0.10.tar.gz | sha256sum
+```
+
+Check WAL-G's release notes for changes to `backup-list --json`,
+`st cat`/`st put` and `delete retain`, which `JustPostgres.WalG` relies on.
+The backup tests exercise all of them.
 
 A new PostgreSQL major version is a breaking change for anyone with an
 existing cluster, so it needs a major (or pre-1.0 minor) version bump and a

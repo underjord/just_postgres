@@ -52,6 +52,8 @@ jobs:
       # Only build for the runner's own architecture
       CC_PRECOMPILER_PRECOMPILE_ONLY_LOCAL: "true"
       ELIXIR_MAKE_CACHE_DIR: cache
+      # Archives must include WAL-G, so fail instead of skipping it
+      JUST_POSTGRES_WALG: "yes"
     steps:
       - name: Install build dependencies
         run: |
@@ -61,6 +63,12 @@ jobs:
             libssl-dev zlib1g-dev
 
       - uses: actions/checkout@v4
+
+      # For WAL-G. Go fetches a newer toolchain itself if WAL-G needs one.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache: false
 
       - uses: actions/cache@v4
         with:

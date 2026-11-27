@@ -1,14 +1,21 @@
 defmodule JustPostgres.Server do
   @moduledoc false
 
-  # Owns one PostgreSQL cluster: prepares directories, runs initdb the first
-  # time, runs `postgres` under MuonTrap and stops it with a fast shutdown.
+  # Owns one PostgreSQL cluster: prepares directories, runs initdb (or
+  # restores a backup) the first time, runs `postgres` under MuonTrap and
+  # stops it with a fast shutdown. With backups configured, it also runs the
+  # backup scheduler while PostgreSQL runs.
 
   use GenServer
 
+  alias JustPostgres.Backup
   alias JustPostgres.OSUser
+  alias JustPostgres.Recovery
+  alias JustPostgres.WalG
 
   require Logger
+
+  @max_retry_interval :timer.hours(1)
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -23,7 +30,9 @@ defmodule JustPostgres.Server do
       opts: opts,
       user: nil,
       env: [],
-      daemon: nil
+      daemon: nil,
+      backup: nil,
+      retries: 0
     }
 
     {:ok, state, {:continue, :start}}
@@ -34,15 +43,26 @@ defmodule JustPostgres.Server do
     opts = state.opts
 
     with {:ok, user} <- resolve_user(opts),
-         env = env(opts),
+         state = %{state | user: user, env: env(opts)},
          :ok <- check_install(opts, user),
          :ok <- prepare_dirs(opts, user),
-         :ok <- maybe_initdb(opts, user, env),
+         :ok <- init_or_restore(state),
          :ok <- write_hba(opts, user),
          :ok <- clear_stale_pid_file(opts[:data_dir]),
-         {:ok, daemon} <- start_postgres(opts, user, env) do
-      {:noreply, %{state | user: user, env: env, daemon: daemon}}
+         {:ok, daemon} <- start_postgres(opts, user, state.env) do
+      state = %{state | daemon: daemon, retries: 0}
+      {:noreply, start_backup(state)}
     else
+      {:retry, reason} ->
+        delay = retry_delay(opts, state.retries)
+
+        Logger.warning(
+          "[JustPostgres] #{format_error(reason)}. Retrying in #{div(delay, 1000)} s."
+        )
+
+        Process.send_after(self(), :retry_start, delay)
+        {:noreply, %{state | retries: state.retries + 1}}
+
       {:error, reason} ->
         Logger.error("[JustPostgres] #{format_error(reason)}")
         {:stop, reason, state}
@@ -51,26 +71,60 @@ defmodule JustPostgres.Server do
 
   @impl GenServer
   def handle_call(:info, _from, state) do
+    {:reply, context(state), state}
+  end
+
+  def handle_call({:swap_data_dir, restored}, _from, state) do
+    # Called by JustPostgres.restore/1 once a backup has been downloaded
+    # next to the data directory. Keep the old cluster rather than deleting
+    # it, in case the restore wasn't what was wanted.
     opts = state.opts
+    data_dir = opts[:data_dir]
+    state = stop_postgres(state)
 
-    info = %{
-      data_dir: opts[:data_dir],
-      socket_dir: opts[:socket_dir],
-      port: opts[:port],
-      superuser: opts[:superuser],
-      install_dir: opts[:install_dir],
-      user: state.user,
-      env: state.env,
-      os_pid: state.daemon && MuonTrap.Daemon.os_pid(state.daemon)
-    }
+    stamp = Calendar.strftime(DateTime.utc_now(), "%Y%m%dT%H%M%SZ")
+    previous = "#{data_dir}.before-restore-#{stamp}"
 
-    {:reply, info, state}
+    previous =
+      if File.exists?(previous),
+        do: "#{previous}-#{System.unique_integer([:positive])}",
+        else: previous
+
+    File.rename!(data_dir, previous)
+    File.rename!(restored, data_dir)
+
+    Logger.info("[JustPostgres] Restored cluster moved into place. The old one is in #{previous}")
+
+    with :ok <- write_hba(opts, state.user),
+         :ok <- clear_stale_pid_file(data_dir),
+         {:ok, daemon} <- start_postgres(opts, state.user, state.env) do
+      {:reply, {:ok, previous}, start_backup(%{state | daemon: daemon})}
+    else
+      {:error, reason} ->
+        Logger.error("[JustPostgres] #{format_error(reason)}")
+        {:stop, reason, {:error, reason}, state}
+    end
   end
 
   @impl GenServer
+  def handle_info(:retry_start, state) do
+    {:noreply, state, {:continue, :start}}
+  end
+
   def handle_info({:EXIT, daemon, reason}, %{daemon: daemon} = state) do
     Logger.error("[JustPostgres] postgres exited unexpectedly: #{inspect(reason)}")
     {:stop, {:postgres_exited, reason}, %{state | daemon: nil}}
+  end
+
+  def handle_info({:EXIT, backup, reason}, %{backup: backup} = state) do
+    # The scheduler doesn't hold anything that's lost by restarting it
+    Logger.error("[JustPostgres] Backup scheduler exited: #{inspect(reason)}. Restarting it.")
+    Process.send_after(self(), :restart_backup, state.opts[:backup][:retry_interval])
+    {:noreply, %{state | backup: nil}}
+  end
+
+  def handle_info(:restart_backup, state) do
+    {:noreply, start_backup(state)}
   end
 
   def handle_info({:EXIT, _pid, _reason}, state) do
@@ -78,26 +132,10 @@ defmodule JustPostgres.Server do
   end
 
   @impl GenServer
-  def terminate(_reason, %{daemon: daemon} = state) when is_pid(daemon) do
-    opts = state.opts
-    timeout_s = max(div(opts[:shutdown_timeout], 1000), 1)
-
-    {output, status} =
-      MuonTrap.cmd(
-        bin(opts, "pg_ctl"),
-        ["stop", "-D", opts[:data_dir], "-m", "fast", "-w", "-t", "#{timeout_s}"],
-        run_opts(state.user, state.env)
-      )
-
-    if status != 0 do
-      Logger.warning("[JustPostgres] pg_ctl stop failed (#{status}): #{output}")
-    end
-
-    if Process.alive?(daemon), do: GenServer.stop(daemon, :shutdown)
+  def terminate(_reason, state) do
+    _ = stop_postgres(state)
     :ok
   end
-
-  def terminate(_reason, _state), do: :ok
 
   ## Setup
 
@@ -112,25 +150,62 @@ defmodule JustPostgres.Server do
     end
   end
 
+  # What JustPostgres.info/1 returns, and what WAL-G commands need
+  defp context(state) do
+    opts = state.opts
+
+    %{
+      data_dir: opts[:data_dir],
+      socket_dir: opts[:socket_dir],
+      port: opts[:port],
+      superuser: opts[:superuser],
+      install_dir: opts[:install_dir],
+      backup: opts[:backup],
+      user: state.user,
+      env: state.env,
+      os_pid: state.daemon && MuonTrap.Daemon.os_pid(state.daemon)
+    }
+  end
+
   @doc false
   @spec env(keyword()) :: [{String.t(), String.t()}]
   def env(opts) do
     lib_dir = Path.join(opts[:install_dir], "lib")
 
+    # Nerves sets LANG=en_US.UTF-8 but ships no locale data
+    ([
+       {"LD_LIBRARY_PATH", lib_dir},
+       {"DYLD_LIBRARY_PATH", lib_dir},
+       {"LANG", "C"},
+       {"LC_ALL", "C"},
+       {"TZ", "UTC"},
+       {"HOME", opts[:data_dir]},
+       {"PGDATA", opts[:data_dir]},
+       {"PGHOST", opts[:socket_dir]},
+       {"PGPORT", Integer.to_string(opts[:port])},
+       {"PGUSER", opts[:superuser]},
+       {"PGDATABASE", "postgres"}
+     ] ++ backup_env(opts[:backup]) ++ Enum.to_list(opts[:env]))
+    |> last_wins()
+  end
+
+  # PostgreSQL passes its environment to archive_command and
+  # restore_command, so WAL-G's settings go to the server itself.
+  defp backup_env(nil), do: []
+
+  defp backup_env(backup) do
     [
-      {"LD_LIBRARY_PATH", lib_dir},
-      {"DYLD_LIBRARY_PATH", lib_dir},
-      # Nerves sets LANG=en_US.UTF-8 but ships no locale data
-      {"LANG", "C"},
-      {"LC_ALL", "C"},
-      {"TZ", "UTC"},
-      {"HOME", opts[:data_dir]},
-      {"PGDATA", opts[:data_dir]},
-      {"PGHOST", opts[:socket_dir]},
-      {"PGPORT", Integer.to_string(opts[:port])},
-      {"PGUSER", opts[:superuser]},
-      {"PGDATABASE", "postgres"}
-    ] ++ opts[:env]
+      {"WALG_COMPRESSION_METHOD", "zstd"},
+      # Never replace archived WAL with different contents. Two clusters
+      # writing to the same prefix fail instead of corrupting each other.
+      {"WALG_PREVENT_WAL_OVERWRITE", "true"},
+      # wal-push runs for every WAL segment. Only log problems.
+      {"WALG_LOG_LEVEL", "ERROR"}
+    ] ++ backup[:env]
+  end
+
+  defp last_wins(env) do
+    env |> Enum.reverse() |> Enum.uniq_by(&elem(&1, 0)) |> Enum.reverse()
   end
 
   defp check_install(opts, user) do
@@ -139,6 +214,9 @@ defmodule JustPostgres.Server do
     cond do
       not File.exists?(postgres) ->
         {:error, {:missing_install, opts[:install_dir]}}
+
+      opts[:backup] && not File.exists?(bin(opts, "wal-g")) ->
+        {:error, {:missing_wal_g, opts[:install_dir]}}
 
       user != nil and OSUser.blocking_ancestor(postgres, user) != nil ->
         {:error, {:not_searchable, OSUser.blocking_ancestor(postgres, user), user.name}}
@@ -190,24 +268,101 @@ defmodule JustPostgres.Server do
     :ok
   end
 
-  defp chown!(path, user) do
+  @doc false
+  @spec chown!(Path.t(), OSUser.t()) :: :ok
+  def chown!(path, user) do
     File.chown!(path, user.uid)
     File.chgrp!(path, user.gid)
   end
 
-  defp maybe_initdb(opts, user, env) do
+  @doc false
+  @spec write_private_file!(Path.t(), iodata(), OSUser.t() | nil) :: :ok
+  def write_private_file!(path, contents, user) do
+    File.write!(path, contents)
+    File.chmod!(path, 0o600)
+    if user, do: chown!(path, user)
+    :ok
+  end
+
+  defp init_or_restore(state) do
+    opts = state.opts
     data_dir = opts[:data_dir]
+
+    # Left over from a restore that was interrupted. The data directory
+    # itself is still intact.
+    File.rm_rf!(Recovery.restoring_dir(data_dir))
 
     case File.read(Path.join(data_dir, "PG_VERSION")) do
       {:ok, version} ->
-        check_major_version(String.trim(version))
+        with :ok <- check_major_version(String.trim(version)),
+             do: ensure_cluster_id(state)
 
       {:error, :enoent} ->
-        initdb(opts, user, env)
+        if opts[:backup],
+          do: init_or_restore_from_storage(state),
+          else: initdb(opts, state.user, state.env)
 
       {:error, reason} ->
         {:error, {:data_dir, data_dir, reason}}
     end
+  end
+
+  defp ensure_cluster_id(%{opts: opts} = state) do
+    if opts[:backup], do: Recovery.ensure_cluster!(opts[:data_dir], state.user)
+    :ok
+  end
+
+  # There's no cluster yet. If the storage has backups, they're from this
+  # cluster's previous life (a dead device or SD card), so restore them
+  # rather than starting over next to them.
+  defp init_or_restore_from_storage(state) do
+    opts = state.opts
+    ctx = context(state)
+
+    case WalG.list(ctx) do
+      {:error, reason} ->
+        {:retry, {:storage_unavailable, reason}}
+
+      {:ok, []} ->
+        with :ok <- initdb(opts, state.user, state.env) do
+          _ = Recovery.new_cluster!(opts[:data_dir], state.user, true)
+          :ok
+        end
+
+      {:ok, backups} ->
+        if opts[:backup][:restore],
+          do: restore_latest(ctx, backups),
+          else: {:error, {:backups_exist, List.last(backups).name}}
+    end
+  end
+
+  defp restore_latest(ctx, backups) do
+    {:ok, backup} = Recovery.select_backup(backups, [])
+    data_dir = ctx.data_dir
+
+    Logger.info("[JustPostgres] No cluster in #{data_dir}. Restoring backup #{backup.name}.")
+
+    if File.ls!(data_dir) == [] do
+      case Recovery.fetch(ctx, backup, %{}) do
+        {:ok, restored} ->
+          File.rmdir!(data_dir)
+          File.rename!(restored, data_dir)
+          :ok
+
+        {:error, {:fetch_failed, _, _} = reason} ->
+          {:retry, reason}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:error, {:data_dir_not_empty, data_dir}}
+    end
+  end
+
+  defp retry_delay(opts, retries) do
+    base = if opts[:backup], do: opts[:backup][:retry_interval], else: :timer.minutes(1)
+    min(base * Integer.pow(2, retries), @max_retry_interval)
   end
 
   defp check_major_version(found) do
@@ -225,9 +380,7 @@ defmodule JustPostgres.Server do
     # none is given, use a random one. Set a real one later via the socket.
     password = opts[:password] || Base.encode64(:crypto.strong_rand_bytes(32))
     pwfile = Path.join(opts[:socket_dir], ".initdb-pwfile")
-    File.write!(pwfile, password)
-    File.chmod!(pwfile, 0o600)
-    if user, do: chown!(pwfile, user)
+    write_private_file!(pwfile, password, user)
 
     args =
       [
@@ -267,15 +420,15 @@ defmodule JustPostgres.Server do
       lines ->
         path = Path.join(opts[:data_dir], "pg_hba.conf")
 
-        File.write!(path, [
-          "# Managed by JustPostgres. Changes are overwritten.\n",
-          Enum.intersperse(lines, "\n"),
-          "\n"
-        ])
-
-        File.chmod!(path, 0o600)
-        if user, do: chown!(path, user)
-        :ok
+        write_private_file!(
+          path,
+          [
+            "# Managed by JustPostgres. Changes are overwritten.\n",
+            Enum.intersperse(lines, "\n"),
+            "\n"
+          ],
+          user
+        )
     end
   end
 
@@ -300,7 +453,15 @@ defmodule JustPostgres.Server do
   end
 
   defp start_postgres(opts, user, env) do
-    args = ["-D", opts[:data_dir] | settings_args(opts)]
+    data_dir = opts[:data_dir]
+    :ok = Recovery.cleanup(data_dir)
+    recovery = Recovery.recovery_settings(data_dir)
+
+    if File.exists?(Path.join(data_dir, "recovery.signal")) do
+      Logger.info("[JustPostgres] Recovering from a restored backup #{inspect(recovery)}")
+    end
+
+    args = ["-D", data_dir | settings_args(opts, recovery)]
 
     daemon_opts =
       [
@@ -314,9 +475,56 @@ defmodule JustPostgres.Server do
     MuonTrap.Daemon.start_link(bin(opts, "postgres"), args, daemon_opts)
   end
 
+  defp stop_postgres(state) do
+    state = stop_backup(state)
+
+    case state.daemon do
+      nil ->
+        state
+
+      daemon ->
+        opts = state.opts
+        timeout_s = max(div(opts[:shutdown_timeout], 1000), 1)
+
+        {output, status} =
+          MuonTrap.cmd(
+            bin(opts, "pg_ctl"),
+            ["stop", "-D", opts[:data_dir], "-m", "fast", "-w", "-t", "#{timeout_s}"],
+            run_opts(state.user, state.env)
+          )
+
+        if status != 0 do
+          Logger.warning("[JustPostgres] pg_ctl stop failed (#{status}): #{output}")
+        end
+
+        if Process.alive?(daemon), do: GenServer.stop(daemon, :shutdown)
+        %{state | daemon: nil}
+    end
+  end
+
+  defp start_backup(%{opts: opts, backup: nil} = state) do
+    if opts[:backup] && state.daemon do
+      {:ok, pid} = Backup.start_link(server: opts[:name], backup: opts[:backup])
+      %{state | backup: pid}
+    else
+      state
+    end
+  end
+
+  defp start_backup(state), do: state
+
+  defp stop_backup(%{backup: nil} = state), do: state
+
+  defp stop_backup(%{backup: pid} = state) do
+    if Process.alive?(pid), do: GenServer.stop(pid, :shutdown)
+    %{state | backup: nil}
+  catch
+    :exit, _ -> %{state | backup: nil}
+  end
+
   @doc false
-  @spec settings_args(keyword()) :: [String.t()]
-  def settings_args(opts) do
+  @spec settings_args(keyword(), map()) :: [String.t()]
+  def settings_args(opts, recovery \\ %{}) do
     defaults =
       %{
         "listen_addresses" => opts[:listen_addresses],
@@ -324,13 +532,33 @@ defmodule JustPostgres.Server do
         "unix_socket_directories" => opts[:socket_dir]
       }
       |> Map.merge(platform_defaults())
+      |> Map.merge(backup_settings(opts))
 
     user_settings = Map.new(opts[:settings], fn {k, v} -> {to_string(k), v} end)
 
     defaults
     |> Map.merge(user_settings)
+    |> Map.merge(recovery)
     |> Enum.sort()
     |> Enum.flat_map(fn {k, v} -> ["-c", "#{k}=#{format_value(v)}"] end)
+  end
+
+  defp backup_settings(opts) do
+    case opts[:backup] do
+      nil ->
+        %{}
+
+      backup ->
+        wal_g = bin(opts, "wal-g")
+
+        %{
+          "archive_mode" => "on",
+          "archive_timeout" => backup[:archive_timeout],
+          "archive_command" => ~s("#{wal_g}" wal-push "%p"),
+          # Only used while recovering from a restored backup
+          "restore_command" => ~s("#{wal_g}" wal-fetch "%f" "%p")
+        }
+    end
   end
 
   # erlinit mounts devtmpfs on /dev with a 1 MiB limit, so POSIX shared
@@ -389,6 +617,14 @@ defmodule JustPostgres.Server do
     "No PostgreSQL installation found in #{dir}. Did just_postgres compile?"
   end
 
+  def format_error({:missing_wal_g, dir}) do
+    """
+    Backups are configured, but there's no WAL-G in #{dir}/bin. just_postgres \
+    was built without it, probably because Go wasn't installed. Install Go and \
+    rebuild with JUST_POSTGRES_WALG=yes, or use a precompiled archive.\
+    """
+  end
+
   def format_error({:major_version_mismatch, found, expected}) do
     """
     The data directory is for PostgreSQL #{found}, but this firmware has \
@@ -404,6 +640,73 @@ defmodule JustPostgres.Server do
   def format_error({:data_dir, dir, reason}) do
     "Can't read #{dir}: #{:file.format_error(reason)}"
   end
+
+  def format_error({:data_dir_not_empty, dir}) do
+    "#{dir} has files in it but no cluster. Refusing to restore a backup over them."
+  end
+
+  def format_error({:storage_unavailable, reason}) do
+    "Can't list backups, so can't tell whether to restore or create a cluster: " <>
+      format_error(reason)
+  end
+
+  def format_error({:backups_exist, name}) do
+    """
+    There's no cluster in the data directory, but the backup storage has \
+    backups (the latest is #{name}). Refusing to create a new cluster next to \
+    them. Set `restore: true` to restore them, or use an empty storage prefix.\
+    """
+  end
+
+  def format_error({:fetch_failed, name, reason}) do
+    "Downloading backup #{name} failed: #{format_error(reason)}"
+  end
+
+  def format_error({:wal_g, status, output}) do
+    "WAL-G exited with status #{status}: #{String.trim(output)}"
+  end
+
+  def format_error(:timeout), do: "WAL-G timed out"
+
+  def format_error({:not_owner, owner}) do
+    """
+    The backup storage belongs to another cluster (#{owner["hostname"]}, since \
+    #{owner["claimed_at"]}), probably a device that was restored from this \
+    one's backups. Not taking backups or deleting old ones. If this device \
+    should take over again, restore it from the storage with \
+    JustPostgres.restore/1. Otherwise give it its own storage prefix.\
+    """
+  end
+
+  def format_error({:foreign_backups, name, system_identifier}) do
+    """
+    The backup storage has backups of a different cluster (#{name}, system \
+    identifier #{system_identifier}). Use a separate storage prefix for each \
+    cluster.\
+    """
+  end
+
+  def format_error(:no_backups), do: "There are no backups in storage"
+
+  def format_error({:no_backup_before, target}) do
+    "There's no backup from before #{inspect(target)}. The oldest one has to come first."
+  end
+
+  def format_error({:unknown_backup, name}), do: "There's no backup named #{inspect(name)}"
+
+  def format_error({:crashed, reason}), do: "crashed: #{inspect(reason)}"
+
+  def format_error({:not_enough_space, dir, needed, available}) do
+    mb = fn bytes -> "#{div(bytes, 1024 * 1024)} MB" end
+
+    """
+    Not enough space in #{dir} to restore: the backup needs about \
+    #{mb.(needed)} with room for WAL, and #{mb.(available)} is free.\
+    """
+  end
+
+  def format_error({:invalid_target, output}),
+    do: "PostgreSQL rejected the recovery target: #{output}"
 
   def format_error(other), do: inspect(other)
 end

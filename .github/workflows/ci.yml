@@ -12,6 +12,7 @@ jobs:
       # Always build from source so the Makefile gets exercised. The cache
       # below keeps this to the first run after the Makefile changes.
       JUST_POSTGRES_BUILD: "1"
+      JUST_POSTGRES_WALG: "yes"
     strategy:
       fail-fast: false
       matrix:
@@ -28,6 +29,12 @@ jobs:
 
       - name: Install PostgreSQL build dependencies
         run: sudo apt-get update && sudo apt-get install -y bison flex libssl-dev zlib1g-dev
+
+      # For WAL-G, which the backup tests need
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache: false
 
       - uses: erlef/setup-beam@main
         with:

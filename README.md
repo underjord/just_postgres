@@ -5,8 +5,13 @@ Run a PostgreSQL server on a Nerves device, using a stock Nerves system.
 `just_postgres` builds a relocatable PostgreSQL into its `priv` directory and
 gives you a child spec that runs it. You don't need a custom Nerves system
 or containers. The server is cross-compiled against the target's own
-glibc, OpenSSL and zlib, so it fits in a normal firmware image. A trimmed
-install adds about 12 MB to the squashfs.
+glibc, OpenSSL and zlib, so it fits in a normal firmware image.
+
+It can also back up continuously to S3-compatible object storage with
+[WAL-G](https://github.com/wal-g/wal-g), so you can restore to any point in
+time, and a replacement device restores itself on first boot.
+
+PostgreSQL adds about 12 MB to the squashfs and WAL-G another 12 MB.
 
 Prebuilt archives are published for `aarch64-linux-gnu` (Raspberry Pi 3, 4
 and 5, and other 64-bit ARM boards) and `x86_64-linux-gnu`, so most projects
@@ -105,6 +110,111 @@ rpi5 kernel has both.
   instead of a confusing one. Minor versions are safe to update and roll
   back.
 
+## Backups
+
+Add `backup:` with [WAL-G settings](https://wal-g.readthedocs.io/STORAGES/)
+for the storage:
+
+```elixir
+{JustPostgres,
+ data_dir: "/data/postgres/data",
+ backup: [
+   env: %{
+     "WALG_S3_PREFIX" => "s3://my-bucket/postgres/#{Nerves.Runtime.serial_number()}",
+     "AWS_ACCESS_KEY_ID" => "...",
+     "AWS_SECRET_ACCESS_KEY" => "...",
+     "AWS_REGION" => "eu-north-1"
+   }
+ ]}
+```
+
+For other S3-compatible services (Cloudflare R2, Backblaze B2, Hetzner,
+MinIO, Garage) add `"AWS_ENDPOINT"` and, if the service needs it,
+`"AWS_S3_FORCE_PATH_STYLE" => "true"`. `WALG_SSH_PREFIX` backs up to any
+machine you can reach over SFTP.
+
+### What happens
+
+* **WAL archiving**: PostgreSQL hands each finished 16 MB WAL segment to
+  `wal-g wal-push`, which compresses it with zstd and uploads it.
+  `archive_timeout` (60 s by default) forces a segment out at least that
+  often, so a dead device loses at most about a minute of commits.
+* **Base backups**: one is taken as soon as a new cluster starts, then every
+  `interval` (24 hours by default). After each one, backups beyond `retain`
+  (7) are deleted, along with WAL that only they needed. With the defaults
+  you can restore to any moment in the last week.
+* **Empty data directory**: if the storage has backups, the latest is
+  restored and all archived WAL replayed before the server accepts
+  connections. A new device with the same configuration, or a fresh SD
+  card, comes back with the data. With `restore: false` it refuses to start
+  instead. Without backups, `initdb` runs as usual.
+* **Unreachable storage**: WAL waits in `pg_wal` on the device and is
+  uploaded once the storage is back, so nothing is lost, but the disk
+  fills if it stays down for long. A data directory that needs restoring
+  waits for the storage instead of creating an empty cluster.
+
+### Watching it
+
+```elixir
+JustPostgres.backup_status()
+#=> %{phase: :idle,
+#     last_backup: %{name: "base_000000010000000000000042", finish_time: ~U[...], ...},
+#     last_error: nil,
+#     next_check_at: ~U[...],
+#     archiver: %{archived_count: 811, failed_count: 0, last_archived_time: ~U[...], ...}}
+```
+
+A growing `archiver.failed_count` means WAL isn't getting out. Failed
+backups are retried with backoff and logged. `JustPostgres.backup_now/0`
+takes a backup right away, and `JustPostgres.list_backups/0` lists what's
+in storage.
+
+### Restoring
+
+To undo a mistake, go back to a point in time:
+
+```elixir
+JustPostgres.restore(target_time: ~U[2026-11-27 09:55:00Z])
+```
+
+This downloads the newest backup from before that time next to the data
+directory while the server keeps running, then stops the server, moves the
+current data directory aside to `data.before-restore-<time>`, and starts
+the restored copy. It replays WAL up to the target and continues on a new
+timeline, which is backed up from then on. Delete the old directory when
+you're happy. You need room on the device for both copies.
+
+`restore/1` also takes `:target_lsn`, `:target_name` (from
+`pg_create_restore_point/1`) and `:target_xid`. Without a target, it
+replays everything that was archived.
+
+### One storage prefix per cluster
+
+Every device needs its own prefix, which is why the example uses the serial
+number. As a safety net, the prefix has an owner marker
+(`just_postgres/owner.json`). A cluster only takes base backups and deletes
+old ones while the marker names it. A restored copy gets a new identity and
+takes over the marker, so if the device it replaced comes back, the old one
+logs an error and stops taking backups instead of competing. WAL is
+uploaded with `WALG_PREVENT_WAL_OVERWRITE`, so archived WAL never gets
+replaced with different contents.
+
+### Things to know
+
+* Backups connect over the Unix socket as the superuser, so the socket's
+  `pg_hba.conf` entry must not need a password (the default is `trust`, and
+  only the server's user and root can reach the socket).
+* Restoring by time uses commit timestamps, which come from the system
+  clock. Raspberry Pis have no RTC, so make sure the clock is set (for
+  example `NervesTime.synchronized?/0`) before relying on `:target_time`.
+* WAL-G settings go to PostgreSQL's environment, because PostgreSQL runs
+  `archive_command`. `JustPostgres.info/1` includes them, secrets too.
+* For client-side encryption, set `WALG_PGP_KEY` (an armored OpenPGP key).
+  libsodium encryption isn't available because WAL-G is built without cgo.
+  Server-side encryption in the bucket also works.
+* WAL-G logs "Archive ... does not exist" errors while a restore replays
+  WAL. That's how PostgreSQL finds the end of the archive, not a failure.
+
 ## What's in the build
 
 * The server, `psql`, `pg_dump`, `pg_basebackup`, `pg_upgrade` and the other
@@ -113,6 +223,8 @@ rpi5 kernel has both.
   `postgres_fdw`
 * OpenSSL (TLS and `pgcrypto`), zlib, and lz4 and zstd (TOAST, WAL and
   backup compression). lz4 and zstd are linked statically.
+* WAL-G, built from source as a static Go binary without cgo, with the S3,
+  SSH and filesystem storage backends
 
 Not included: ICU, readline, LLVM JIT, PL/Perl, PL/Python, PL/Tcl and
 `uuid-ossp` (`gen_random_uuid()` and `uuidv7()` are built in).
@@ -130,6 +242,11 @@ includes 32-bit ARM, RISC-V, musl systems and macOS hosts. A source build
 needs `make`, `bison`, `flex`, `perl`, `curl` and, when cross-compiling, the
 host's `zic`. Source tarballs are checked against pinned SHA-256 hashes and
 cached in `~/.cache/just_postgres`.
+
+WAL-G is built when `go` is installed (any version from 1.21 on; it fetches
+the toolchain WAL-G needs). Without Go, the build warns and leaves WAL-G
+out, and the `:backup` option fails with an explanation. Set
+`JUST_POSTGRES_WALG=yes` to make a missing Go an error instead.
 
 To force a source build:
 
@@ -150,4 +267,6 @@ checksums are only included in Hex releases.
 
 `just_postgres` is Apache-2.0. PostgreSQL is distributed under the
 [PostgreSQL License](https://www.postgresql.org/about/licence/), lz4 under
-BSD-2-Clause and zstd under BSD-3-Clause.
+BSD-2-Clause, zstd under BSD-3-Clause and WAL-G under Apache-2.0. The
+install includes their license texts, and those of the Go modules compiled
+into WAL-G, in `share/licenses`.

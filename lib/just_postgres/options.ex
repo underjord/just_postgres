@@ -92,12 +92,82 @@ defmodule JustPostgres.Options do
       """
     ],
     env: [
-      type: {:list, {:tuple, [:string, :string]}},
+      type: {:or, [{:list, {:tuple, [:string, :string]}}, {:map, :string, :string}]},
       default: [],
       doc: """
       Extra environment variables for PostgreSQL. Commands run by the server,
       such as `archive_command`, inherit them.
       """
+    ],
+    backup: [
+      type: :keyword_list,
+      doc: """
+      Continuous backups with [WAL-G](https://wal-g.readthedocs.io/). When
+      set, WAL is archived to object storage as it's written, and base backups
+      are taken on a schedule, so the database can be restored to any point
+      in time since the oldest backup. See the README for the details.
+      """,
+      keys: [
+        env: [
+          type: {:or, [{:list, {:tuple, [:string, :string]}}, {:map, :string, :string}]},
+          required: true,
+          doc: """
+          WAL-G settings, such as `WALG_S3_PREFIX` and `AWS_ACCESS_KEY_ID`.
+          They're passed to WAL-G as environment variables, so any setting
+          from the WAL-G documentation works. A storage prefix is required.
+          Use a different prefix for every cluster.
+          """
+        ],
+        interval: [
+          type: :pos_integer,
+          default: :timer.hours(24),
+          doc: """
+          Milliseconds between base backups. Restoring replays WAL from the
+          base backup before the target time, so more frequent backups mean
+          faster restores.
+          """
+        ],
+        retain: [
+          type: :pos_integer,
+          default: 7,
+          doc: """
+          Number of full base backups to keep. After each backup, older
+          backups and the WAL that only they need are deleted. With daily
+          backups, the default allows restores to any point in the last
+          week.
+          """
+        ],
+        archive_timeout: [
+          type: :non_neg_integer,
+          default: 60,
+          doc: """
+          PostgreSQL's `archive_timeout` in seconds. WAL is uploaded in 16 MB
+          segments, and this forces a partly filled segment to be uploaded
+          after this long. It's about how much recent data a dead device can
+          lose. `0` turns it off.
+          """
+        ],
+        restore: [
+          type: :boolean,
+          default: true,
+          doc: """
+          What to do when the data directory has no cluster but the storage
+          has backups, for example on a replacement device or SD card. When
+          `true`, the latest backup is restored and all archived WAL is
+          replayed. When `false`, the server refuses to start rather than
+          creating a new cluster next to the old one's backups.
+          """
+        ],
+        retry_interval: [
+          type: :pos_integer,
+          default: :timer.minutes(1),
+          doc: """
+          Milliseconds to wait before retrying a failed backup or an
+          unreachable storage. The wait doubles on each failure, up to an
+          hour.
+          """
+        ]
+      ]
     ],
     log_level: [
       type: {:in, [:emergency, :alert, :critical, :error, :warning, :notice, :info, :debug]},
@@ -133,7 +203,11 @@ defmodule JustPostgres.Options do
   @doc false
   @spec validate!(keyword()) :: keyword()
   def validate!(opts) do
-    opts = NimbleOptions.validate!(opts, @schema)
+    # Allow `backup: nil` so that backups can be turned off with a conditional
+    opts =
+      opts
+      |> Keyword.reject(&match?({:backup, nil}, &1))
+      |> NimbleOptions.validate!(@schema)
 
     opts
     |> Keyword.put_new_lazy(:socket_dir, fn ->
@@ -141,5 +215,33 @@ defmodule JustPostgres.Options do
     end)
     |> Keyword.put_new_lazy(:install_dir, &JustPostgres.install_dir/0)
     |> Keyword.update!(:data_dir, &Path.expand/1)
+    |> Keyword.update!(:env, &Enum.to_list/1)
+    |> validate_backup!()
+  end
+
+  # WAL-G settings that name the storage. WAL-G can also read them from a
+  # config file.
+  @storage_settings ~w(WALG_S3_PREFIX WALE_S3_PREFIX WALG_SSH_PREFIX WALG_FILE_PREFIX
+                       WALG_STORAGE_PREFIX WALG_CONFIG_PATH)
+
+  defp validate_backup!(opts) do
+    case opts[:backup] do
+      nil ->
+        opts
+
+      backup ->
+        env = Enum.to_list(backup[:env])
+        check_storage_setting!(env)
+        Keyword.put(opts, :backup, Keyword.put(backup, :env, env))
+    end
+  end
+
+  defp check_storage_setting!(env) do
+    if not Enum.any?(env, fn {k, _} -> k in @storage_settings end) do
+      raise ArgumentError, """
+      JustPostgres backup env needs a storage prefix: one of \
+      #{Enum.join(@storage_settings, ", ")}\
+      """
+    end
   end
 end
