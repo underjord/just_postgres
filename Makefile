@@ -71,7 +71,13 @@ PG_PREFIX = /usr/local/pgsql
 
 ifneq ($(TARGET_TRIPLE),$(BUILD_TRIPLE))
 CROSS_COMPILING = yes
-CONFIGURE_CROSS_ARGS = --host=$(TARGET_TRIPLE) --build=$(BUILD_TRIPLE)
+# configure checks these linker flags by running a test program, which it
+# can't do when cross-compiling, so it assumes "no". Without
+# --export-dynamic, extensions can't resolve symbols in the server and even
+# initdb fails. GNU ld supports both.
+CONFIGURE_CROSS_ARGS = --host=$(TARGET_TRIPLE) --build=$(BUILD_TRIPLE) \
+	pgac_cv_prog_cc_LDFLAGS_EX_BE__Wl___export_dynamic=yes \
+	pgac_cv_prog_cc_LDFLAGS__Wl___as_needed=yes
 # The timezone compiler runs at install time, so it must run on the build
 # machine. Nearly every Linux and macOS install has one.
 HOST_ZIC := $(shell command -v zic 2>/dev/null || ls /usr/sbin/zic 2>/dev/null)
@@ -88,6 +94,12 @@ STRIP = $(patsubst %gcc,%strip,$(CC))
 else
 STRIP = strip
 endif
+endif
+
+ifneq ($(filter %gcc,$(CC)),)
+READELF ?= $(patsubst %gcc,%readelf,$(CC))
+else
+READELF ?= readelf
 endif
 
 JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
@@ -146,6 +158,10 @@ endif
 ifneq ($(TARGET_DARWIN),yes)
 	find $(STAGING)$(PG_PREFIX)/bin -type f -exec $(STRIP) {} +
 	find $(STAGING)$(PG_PREFIX)/lib -type f -name '*.so*' -exec $(STRIP) --strip-unneeded {} +
+	@# Extensions resolve symbols in the server binary. If they aren't
+	@# exported, initdb fails on the device, so catch it here instead.
+	@$(READELF) --dyn-syms -W $(STAGING)$(PG_PREFIX)/bin/postgres | grep -q ' CurrentMemoryContext$$' || \
+		(echo "just_postgres: bin/postgres doesn't export its symbols (missing -Wl,--export-dynamic?)"; exit 1)
 endif
 	touch $@
 

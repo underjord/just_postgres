@@ -80,6 +80,11 @@ defmodule JustPostgresTest do
     assert output =~ "password authentication failed"
   end
 
+  test "isn't ready when the server isn't running" do
+    refute JustPostgres.ready?(:not_started)
+    assert {:error, :timeout} = JustPostgres.wait_until_ready(:not_started, 200)
+  end
+
   test "rewrites pg_hba.conf from :hba", %{dir: dir} do
     hba = ["local all all trust", "host all all 127.0.0.1/32 reject"]
     opts = server_opts(dir, hba: hba)

@@ -152,9 +152,8 @@ defmodule JustPostgres.Server do
     data_dir = opts[:data_dir]
     socket_dir = opts[:socket_dir]
 
-    File.mkdir_p!(Path.dirname(data_dir))
-    File.mkdir_p!(data_dir)
-    File.mkdir_p!(socket_dir)
+    mkdir_p_searchable!(data_dir)
+    mkdir_p_searchable!(socket_dir)
 
     # Don't touch the ownership of an existing cluster. A fresh, empty data
     # directory gets handed over to the server's user.
@@ -172,6 +171,23 @@ defmodule JustPostgres.Server do
         do: OSUser.blocking_ancestor(data_dir, user) || OSUser.blocking_ancestor(socket_dir, user)
 
     if blocked, do: {:error, {:not_searchable, blocked, user.name}}, else: :ok
+  end
+
+  # Like File.mkdir_p!/1, but directories that get created are 0755 instead of
+  # following the umask. On Nerves the umask leaves new directories closed
+  # to other users, which would lock the server's user out of its own data.
+  defp mkdir_p_searchable!(path) do
+    if not File.dir?(path) do
+      mkdir_p_searchable!(Path.dirname(path))
+
+      case File.mkdir(path) do
+        :ok -> File.chmod!(path, 0o755)
+        {:error, :eexist} -> :ok
+        {:error, reason} -> raise File.Error, reason: reason, action: "make directory", path: path
+      end
+    end
+
+    :ok
   end
 
   defp chown!(path, user) do

@@ -95,10 +95,24 @@ defmodule JustPostgres do
 
   @doc """
   Return true if the server accepts connections
+
+  Returns false while the server is starting, including while `initdb`
+  runs on first boot, and when it isn't running.
   """
   @spec ready?(server()) :: boolean()
   def ready?(server \\ __MODULE__) do
-    info = info(server)
+    case GenServer.whereis(server) do
+      nil -> false
+      _pid -> isready?(info(server))
+    end
+  catch
+    # Still in initdb or setup, or stopped in the meantime
+    :exit, _reason -> false
+  end
+
+  defp isready?(%{os_pid: nil}), do: false
+
+  defp isready?(info) do
     pg_isready = Path.join([info.install_dir, "bin", "pg_isready"])
 
     {_, status} =
@@ -113,10 +127,13 @@ defmodule JustPostgres do
   @doc """
   Wait until the server accepts connections
 
-  Returns `:ok`, or `{:error, :timeout}` after `timeout` milliseconds.
+  Returns `:ok`, or `{:error, :timeout}` after `timeout` milliseconds. It's
+  fine to call this before the server has started. The first start runs
+  `initdb`, which can take a while on slow devices, so the default timeout is
+  generous.
   """
   @spec wait_until_ready(server(), timeout()) :: :ok | {:error, :timeout}
-  def wait_until_ready(server \\ __MODULE__, timeout \\ 30_000) do
+  def wait_until_ready(server \\ __MODULE__, timeout \\ 120_000) do
     deadline = System.monotonic_time(:millisecond) + timeout
     do_wait_until_ready(server, deadline)
   end
