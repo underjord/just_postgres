@@ -4,15 +4,23 @@
 # pins the glibc baseline to 2.36, so the binaries run on any Nerves system
 # with glibc 2.36 or newer, and on most desktop Linux distributions.
 #
-# Pushing a v* tag publishes a GitHub release with the archives. Pull
-# requests that touch the build, and manual runs, only build and smoke test
-# them and upload them as workflow artifacts.
+# Pushing a v* tag publishes a GitHub release with the archives. Pushes and
+# pull requests that touch the build, and manual runs, only build and smoke
+# test them and upload them as workflow artifacts.
 name: Precompile
 
 on:
   push:
     tags:
       - "v*"
+    branches:
+      - main
+    paths:
+      - Makefile
+      - mix.exs
+      - mix.lock
+      - scripts/**
+      - .github/workflows/precompile.yml
   pull_request:
     paths:
       - Makefile
